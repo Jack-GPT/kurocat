@@ -2213,6 +2213,61 @@ fn win_configure_local_webview2_runtime() {
     }
 }
 
+/// Keeps the kill-on-close job object handle alive for the whole process lifetime.
+/// The handle must never be closed: closing it is what triggers the kill, so it is the
+/// job's only owner and dies with us (the kernel closes it on exit, which is the point).
+#[cfg(windows)]
+static WINDOWS_JOB_HANDLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// WebView2 spawns its `msedgewebview2.exe` browser/GPU/renderer helpers as ordinary
+/// child processes. When KuroCat dies **hard** - a crash, a forced "end task", or the
+/// update restart path - nothing gets to run our exit code, and the whole helper tree
+/// can survive with no parent: the cat disappears, but several `msedgewebview2.exe`
+/// keep the EBWebView profile and the CPU busy until the machine is rebooted.
+///
+/// A "kill on job close" job object moves that cleanup into the kernel: the moment the
+/// last handle to the job goes away - which happens however this process dies, including
+/// `TerminateProcess` - Windows terminates every process the job covers. It is the same
+/// guarantee Electron/Chromium rely on, and it costs two syscalls at startup. We assign
+/// ourselves *before* Tauri starts, so the WebView2 tree is created already inside it.
+#[cfg(windows)]
+fn win_kill_webview2_children_on_exit() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return;
+        }
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if configured == 0
+            || AssignProcessToJobObject(job, GetCurrentProcess()) == 0
+        {
+            // Best effort only: Windows 7 cannot nest job objects, so being launched from
+            // a process that already owns a job (some terminals / installers) makes the
+            // assignment fail. Leave the old behaviour untouched in that case.
+            let _ = CloseHandle(job);
+            return;
+        }
+        // Deliberately never closed: the handle must outlive everything else, because
+        // closing it is precisely what fires the kill.
+        WINDOWS_JOB_HANDLE.store(job as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn linux_configure_display_env() {
     // Prevent WebKitGTK 4.1 DMABUF blank/black transparent window issues on KylinOS/Mesa/NVIDIA/VMs
@@ -2236,6 +2291,7 @@ pub fn run() {
     #[cfg(windows)]
     {
         win_wait_for_previous_pid_if_requested();
+        win_kill_webview2_children_on_exit();
         win_configure_local_webview2_runtime();
     }
     #[cfg(target_os = "linux")]
